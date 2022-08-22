@@ -59,6 +59,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         (in that case, only the actor gradient is used)
         By default, the actor and the critic have two separate LSTM.
     :param enable_critic_lstm: Use a seperate LSTM for the critic.
+    :param reset_hidden: Reset the hidden layer in the LSTMs between episodes (setting
+        this to False can be useful for meta-RL or domain randomization).
     :param lstm_kwargs: Additional keyword arguments to pass the the LSTM
         constructor.
     """
@@ -86,7 +88,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
+        reset_hidden: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
         self.lstm_output_dim = lstm_hidden_size
         super().__init__(
@@ -107,6 +111,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            **kwargs,
         )
 
         self.lstm_kwargs = lstm_kwargs or {}
@@ -142,6 +147,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 **self.lstm_kwargs,
             )
 
+        # Reset hidden state between episodes
+        # Useful for Meta-RL and domain randomization
+        self.reset_hidden = reset_hidden
+
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
@@ -163,6 +172,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         lstm_states: Tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
         lstm: nn.LSTM,
+        reset_hidden: bool,
     ) -> Tuple[th.Tensor, th.Tensor]:
         """
         Do a forward pass in the LSTM network.
@@ -186,11 +196,13 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         # If we don't have to reset the state in the middle of a sequence
         # we can avoid the for loop, which speeds up things
-        if th.all(episode_starts == 0.0):
+        # If reset hidden is False, we can always just do this...
+        if (not reset_hidden) or th.all(episode_starts == 0.0):
             lstm_output, lstm_states = lstm(features_sequence, lstm_states)
             lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
             return lstm_output, lstm_states
 
+        print("We get here....")
         lstm_output = []
         # Iterate over the sequence
         for features, episode_start in zip_strict(features_sequence, episode_starts):
@@ -203,6 +215,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 ),
             )
             lstm_output += [hidden]
+
         # Sequence to batch
         # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
         lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
@@ -228,9 +241,13 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # Preprocess the observation if needed
         features = self.extract_features(obs)
         # latent_pi, latent_vf = self.mlp_extractor(features)
-        latent_pi, lstm_states_pi = self._process_sequence(features, lstm_states.pi, episode_starts, self.lstm_actor)
+        latent_pi, lstm_states_pi = self._process_sequence(
+            features, lstm_states.pi, episode_starts, self.lstm_actor, self.reset_hidden
+        )
         if self.lstm_critic is not None:
-            latent_vf, lstm_states_vf = self._process_sequence(features, lstm_states.vf, episode_starts, self.lstm_critic)
+            latent_vf, lstm_states_vf = self._process_sequence(
+                features, lstm_states.vf, episode_starts, self.lstm_critic, self.reset_hidden
+            )
         elif self.shared_lstm:
             # Re-use LSTM features but do not backpropagate
             latent_vf = latent_pi.detach()
@@ -266,7 +283,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         :return: the action distribution and new hidden states.
         """
         features = self.extract_features(obs)
-        latent_pi, lstm_states = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
+        latent_pi, lstm_states = self._process_sequence(
+            features, lstm_states, episode_starts, self.lstm_actor, self.reset_hidden
+        )
         latent_pi = self.mlp_extractor.forward_actor(latent_pi)
         return self._get_action_dist_from_latent(latent_pi), lstm_states
 
@@ -287,10 +306,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         """
         features = self.extract_features(obs)
         if self.lstm_critic is not None:
-            latent_vf, lstm_states_vf = self._process_sequence(features, lstm_states, episode_starts, self.lstm_critic)
+            latent_vf, lstm_states_vf = self._process_sequence(
+                features, lstm_states, episode_starts, self.lstm_critic, self.reset_hidden
+            )
         elif self.shared_lstm:
             # Use LSTM from the actor
-            latent_pi, _ = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
+            latent_pi, _ = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor, self.reset_hidden)
             latent_vf = latent_pi.detach()
         else:
             latent_vf = self.critic(features)
@@ -319,10 +340,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        latent_pi, _ = self._process_sequence(features, lstm_states.pi, episode_starts, self.lstm_actor)
+        latent_pi, _ = self._process_sequence(features, lstm_states.pi, episode_starts, self.lstm_actor, self.reset_hidden)
 
         if self.lstm_critic is not None:
-            latent_vf, _ = self._process_sequence(features, lstm_states.vf, episode_starts, self.lstm_critic)
+            latent_vf, _ = self._process_sequence(
+                features, lstm_states.vf, episode_starts, self.lstm_critic, self.reset_hidden
+            )
         elif self.shared_lstm:
             latent_vf = latent_pi.detach()
         else:
@@ -416,7 +439,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         # Remove batch dimension if needed
         if not vectorized_env:
-            actions = actions.squeeze(axis=0)
+            actions = actions[0]
 
         return actions, states
 
@@ -458,6 +481,8 @@ class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
     :param shared_lstm: Whether the LSTM is shared between the actor and the critic.
         By default, only the actor has a recurrent network.
     :param enable_critic_lstm: Use a seperate LSTM for the critic.
+    :param reset_hidden: Reset the hidden layer in the LSTMs between episodes (setting
+        this to False can be useful for meta-RL or domain randomization).
     :param lstm_kwargs: Additional keyword arguments to pass the the LSTM
         constructor.
     """
@@ -483,9 +508,10 @@ class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
-        shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
+        reset_hidden: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
         super().__init__(
             observation_space,
@@ -507,9 +533,10 @@ class RecurrentActorCriticCnnPolicy(RecurrentActorCriticPolicy):
             optimizer_kwargs,
             lstm_hidden_size,
             n_lstm_layers,
-            shared_lstm,
             enable_critic_lstm,
+            reset_hidden,
             lstm_kwargs,
+            **kwargs,
         )
 
 
@@ -550,6 +577,8 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
     :param shared_lstm: Whether the LSTM is shared between the actor and the critic.
         By default, only the actor has a recurrent network.
     :param enable_critic_lstm: Use a seperate LSTM for the critic.
+    :param reset_hidden: Reset the hidden layer in the LSTMs between episodes (setting
+        this to False can be useful for meta-RL or domain randomization).
     :param lstm_kwargs: Additional keyword arguments to pass the the LSTM
         constructor.
     """
@@ -575,9 +604,10 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
-        shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
+        reset_hidden: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ):
         super().__init__(
             observation_space,
@@ -599,7 +629,8 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
             optimizer_kwargs,
             lstm_hidden_size,
             n_lstm_layers,
-            shared_lstm,
             enable_critic_lstm,
+            reset_hidden,
             lstm_kwargs,
+            **kwargs,
         )
