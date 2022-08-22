@@ -202,7 +202,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
             return lstm_output, lstm_states
 
-        print("We get here....")
         lstm_output = []
         # Iterate over the sequence
         for features, episode_start in zip_strict(features_sequence, episode_starts):
